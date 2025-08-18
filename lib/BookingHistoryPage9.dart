@@ -25,6 +25,7 @@ class _BookingHistoryPageState extends State<BookingHistoryPage> {
   String? errorMessage;
 
   Timer? _timer;
+
   String getStatusLabel(String status) {
     switch (status) {
       case 'pending':
@@ -36,7 +37,7 @@ class _BookingHistoryPageState extends State<BookingHistoryPage> {
       case 'completed':
         return 'เสร็จสิ้น';
       case 'waiting_farmer_confirm':
-        return 'รอชาวนายืนยันเสร็จสิ้นงาน'; // <--- เพิ่มบรรทัดนี้
+        return 'รอชาวนายืนยันเสร็จสิ้นงาน';
       default:
         return 'สถานะไม่ทราบ';
     }
@@ -70,11 +71,36 @@ class _BookingHistoryPageState extends State<BookingHistoryPage> {
     return value.toString();
   }
 
-  // ฟังก์ชันสำหรับแปลงวันที่
+  // ฟังก์ชันช่วยจัดการลบหรือแทนที่ตัวอักษรในสตริงวันที่ให้ถูกต้องก่อนแปลง
+  String sanitizeDateString(String dateStr) {
+    if (dateStr.endsWith('Z') && dateStr.contains('+00:00')) {
+      // ลบ 'Z' ทิ้ง
+      return dateStr.replaceAll('Z', '');
+    } else if (dateStr.endsWith('Z') && !dateStr.contains('+00:00')) {
+      // แทนที่ 'Z' ด้วย '+00:00'
+      return dateStr.replaceAll('Z', '+00:00');
+    }
+    return dateStr;
+  }
+
+  // ฟังก์ชันแปลงวันที่เป็นสตริงในรูปแบบ วัน/เดือน/ปี
   String _formatDate(String? dateStr) {
     if (dateStr == null || dateStr.isEmpty) return '-';
-    final date = DateTime.tryParse(dateStr);
-    if (date == null) return '-';
+
+    String sanitizedDateStr = dateStr;
+    if (dateStr.endsWith('Z') && dateStr.contains('+00:00')) {
+      sanitizedDateStr = dateStr.replaceAll('Z', '');
+    } else if (dateStr.endsWith('Z') && !dateStr.contains('+00:00')) {
+      sanitizedDateStr = dateStr.replaceAll('Z', '+00:00');
+    }
+
+    DateTime? date;
+    try {
+      date = DateTime.parse(sanitizedDateStr).toLocal();
+    } catch (e) {
+      return '-';
+    }
+
     return '${date.day}/${date.month}/${date.year}';
   }
 
@@ -92,29 +118,41 @@ class _BookingHistoryPageState extends State<BookingHistoryPage> {
     }
   }
 
-  // ฟังก์ชันคำนวณเวลานับถอยหลัง 24 ชั่วโมงจาก createdAt
+  // ฟังก์ชันคำนวณเวลานับถอยหลัง 48 ชั่วโมงจาก createdAt
   Duration _timeLeft(String createdAtStr) {
     if (createdAtStr.isEmpty) return Duration.zero;
 
-    // 1. แปลง string เป็น DateTime (UTC) แล้วแปลงเป็น Local (เวลาประเทศไทย)
-    final createdAt = DateTime.parse('${createdAtStr}Z').toLocal();
+    String sanitizedDateStr = createdAtStr;
+    if (createdAtStr.endsWith('Z') && createdAtStr.contains('+00:00')) {
+      sanitizedDateStr = createdAtStr.replaceAll('Z', '');
+    } else if (createdAtStr.endsWith('Z') && !createdAtStr.contains('+00:00')) {
+      sanitizedDateStr = createdAtStr.replaceAll('Z', '+00:00');
+    }
 
-    // 2. เวลาปัจจุบัน (Local)
+    final createdAt = DateTime.parse(sanitizedDateStr).toLocal();
     final nowLocal = DateTime.now();
-
-    // 3. เวลาสิ้นสุด 48 ชั่วโมงหลังจอง
     final deadline = createdAt.add(const Duration(hours: 48));
     final diff = deadline.difference(nowLocal);
 
     return diff.isNegative ? Duration.zero : diff;
   }
 
+  // ฟังก์ชันคำนวณเวลานับถอยหลัง 24 ชั่วโมงจาก createdAt
   Duration _editTimeLeft(String createdAtStr) {
     if (createdAtStr.isEmpty) return Duration.zero;
-    final createdAt = DateTime.parse('${createdAtStr}Z').toLocal();
+
+    String sanitizedDateStr = createdAtStr;
+    if (createdAtStr.endsWith('Z') && createdAtStr.contains('+00:00')) {
+      sanitizedDateStr = createdAtStr.replaceAll('Z', '');
+    } else if (createdAtStr.endsWith('Z') && !createdAtStr.contains('+00:00')) {
+      sanitizedDateStr = createdAtStr.replaceAll('Z', '+00:00');
+    }
+
+    final createdAt = DateTime.parse(sanitizedDateStr).toLocal();
     final nowLocal = DateTime.now();
     final deadline = createdAt.add(const Duration(hours: 24));
     final diff = deadline.difference(nowLocal);
+
     return diff.isNegative ? Duration.zero : diff;
   }
 
@@ -128,6 +166,7 @@ class _BookingHistoryPageState extends State<BookingHistoryPage> {
   }
 
   Future<void> fetchBookingHistory() async {
+    if (!mounted) return;
     setState(() {
       isLoading = true;
       errorMessage = null;
@@ -170,6 +209,7 @@ class _BookingHistoryPageState extends State<BookingHistoryPage> {
           .eq('farmer_id', widget.farmerId)
           .order('created_at', ascending: false);
 
+      if (!mounted) return;
       if (data == null) {
         setState(() {
           errorMessage = 'ไม่พบข้อมูล';
@@ -239,6 +279,7 @@ class _BookingHistoryPageState extends State<BookingHistoryPage> {
           .eq('farmer_id', widget.farmerId)
           .order('created_at', ascending: false);
 
+      if (!mounted) return;
       final List<Map<String, dynamic>> loadedBookings =
           (updatedData as List)
               .map<Map<String, dynamic>>((item) {
@@ -322,11 +363,13 @@ class _BookingHistoryPageState extends State<BookingHistoryPage> {
               .cast<Map<String, dynamic>>()
               .toList();
 
+      if (!mounted) return;
       setState(() {
         bookings = loadedBookings;
         isLoading = false;
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         errorMessage = e.toString();
         isLoading = false;
@@ -774,7 +817,7 @@ class _BookingHistoryPageState extends State<BookingHistoryPage> {
                                               ),
                                               child: Text(
                                                 'หมดเวลาแก้ไขการจอง (24 ชั่วโมงหลังจอง)',
-                                                style: TextStyle(
+                                                style: const TextStyle(
                                                   color: Colors.red,
                                                   fontSize: 12,
                                                 ),
@@ -823,7 +866,6 @@ class _BookingHistoryPageState extends State<BookingHistoryPage> {
                                     label: 'ประเภทพาหนะ',
                                     value: safeString(booking["vehicleType"]),
                                   ),
-
                                   _buildDetailItem(
                                     label: 'จำนวนไร่',
                                     value: safeString(booking["raiAmount"]),
@@ -866,7 +908,6 @@ class _BookingHistoryPageState extends State<BookingHistoryPage> {
                                 ),
                               ),
                               const Spacer(),
-
                               _buildActionButton(
                                 label: 'ให้คะแนน',
                                 onPressed:

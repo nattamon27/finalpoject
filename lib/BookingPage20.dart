@@ -1,5 +1,4 @@
-import 'dart:async'; // เพิ่ม import สำหรับ Timer
-
+import 'dart:async';
 import 'package:appfinal/AgriVehicleManagementPage21.dart';
 import 'package:appfinal/ContactAdminPage24.dart';
 import 'package:appfinal/DashboardPage18.dart';
@@ -23,6 +22,7 @@ class _BookingPageState extends State<BookingPage> {
   // Filters
   String? selectedStatus;
   String? selectedVehicleType;
+
   String mapTimePeriodLabel(dynamic timePeriod) {
     switch (timePeriod) {
       case 'morning':
@@ -63,7 +63,7 @@ class _BookingPageState extends State<BookingPage> {
   List<Map<String, dynamic>> cancellationRequests = [];
   bool _isLoadingCancellationRequests = true;
 
-  Map<String, Duration> _countdownDurations = {};
+  Timer? _cancellationTimer;
   Timer? _countdownTimer;
 
   @override
@@ -73,85 +73,62 @@ class _BookingPageState extends State<BookingPage> {
     selectedStatus = null;
     selectedVehicleType = null;
     _refreshData();
+    _startCancellationTimer();
     _startCountdownTimer();
   }
 
   @override
   void dispose() {
+    _cancellationTimer?.cancel();
     _countdownTimer?.cancel();
     super.dispose();
   }
 
   void _startCountdownTimer() {
     _countdownTimer?.cancel();
-    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      bool updated = false;
-      final now = DateTime.now().toUtc();
-
-      _countdownDurations.forEach((key, duration) {
-        if (duration.inSeconds > 0) {
-          _countdownDurations[key] = duration - const Duration(seconds: 1);
-          updated = true;
-        }
+    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      setState(() {
+        // Trigger rebuild to update countdown timers
       });
-
-      if (updated) {
-        setState(() {});
-      }
     });
   }
 
-  Future<void> _autoCancelExpiredRequests() async {
-    try {
-      final currentRenterId = supabase.auth.currentUser?.id;
-      if (currentRenterId == null) return;
+  void _startCancellationTimer() {
+    _cancellationTimer?.cancel();
+    _cancellationTimer = Timer.periodic(const Duration(minutes: 1), (timer) {
+      _checkAndAutoApproveCancellations();
+    });
+  }
 
-      final now = DateTime.now().toUtc();
+  Future<void> _checkAndAutoApproveCancellations() async {
+    final now = DateTime.now().toUtc();
+    List<Map<String, dynamic>> expiredRequests = [];
 
-      // Fetch cancellation requests older than 24 hours that are still pending approval
-      final expiredRequests = await supabase
-          .from('bookingcancellations')
-          .select('cancellation_id, booking_id')
-          .eq('cancelled_by', 'farmer') // Only farmer cancellation requests
-          .lt(
-            'cancelled_at',
-            now.subtract(const Duration(hours: 24)).toIso8601String(),
-          )
-          .inFilter(
-            'booking_id',
-            await supabase
-                .from('bookings')
-                .select('booking_id')
-                .eq('renter_id', currentRenterId),
-          )
-          .limit(100);
-
-      if (expiredRequests != null && expiredRequests is List) {
-        for (var request in expiredRequests) {
-          final cancellationId = request['cancellation_id'];
-          final bookingId = request['booking_id'];
-
-          // Update booking status to 'cancelled'
-          await supabase
-              .from('bookings')
-              .update({'status': 'cancelled'})
-              .eq('booking_id', bookingId);
-
-          // Delete the cancellation request row
-          await supabase
-              .from('bookingcancellations')
-              .delete()
-              .eq('cancellation_id', cancellationId);
+    for (var request in cancellationRequests) {
+      final cancelledAt = DateTime.tryParse(request['cancelledAt'] ?? '');
+      if (cancelledAt != null) {
+        final diff = now.difference(cancelledAt);
+        if (diff.inHours >= 24) {
+          expiredRequests.add(request);
         }
       }
-    } catch (e) {
-      print('Error auto-cancelling expired requests: $e');
+    }
+
+    if (expiredRequests.isNotEmpty) {
+      for (var request in expiredRequests) {
+        await _autoApproveCancellation(
+          request['cancellationId'],
+          request['bookingId'],
+        );
+      }
+      // Refresh data after auto-approval
+      await _fetchCancellationRequests();
+      await _fetchBookings();
     }
   }
 
   Future<void> _refreshData() async {
     await _fetchUserProfile();
-    await _autoCancelExpiredRequests();
     await _fetchBookings();
     await _fetchCancellationRequests();
   }
@@ -325,6 +302,12 @@ class _BookingPageState extends State<BookingPage> {
                 'statusColor': _mapStatusColor(e['status']),
               };
             }).toList();
+
+        // เพิ่มตรงนี้
+        print('=== DEBUG: Booking created_at ===');
+        for (var b in bookings) {
+          print('booking_id: ${b['id']} | created_at: ${b['created_at']}');
+        }
       } else {
         bookings = [];
       }
@@ -452,6 +435,7 @@ class _BookingPageState extends State<BookingPage> {
     }).toList();
   }
 
+  // ฟังก์ชันดึงคำขอยกเลิกการจองจาก bookingcancellations
   Future<void> _fetchCancellationRequests() async {
     setState(() {
       _isLoadingCancellationRequests = true;
@@ -521,17 +505,6 @@ class _BookingPageState extends State<BookingPage> {
                 mainImageUrl = vehicleImages[0]['image_url'];
               }
 
-              final cancelledAtStr = e['cancelled_at'];
-              Duration countdown = Duration.zero;
-              if (cancelledAtStr != null) {
-                final cancelledAt = DateTime.parse(cancelledAtStr).toUtc();
-                final expiryTime = cancelledAt.add(const Duration(hours: 24));
-                final nowUtc = DateTime.now().toUtc();
-                countdown = expiryTime.difference(nowUtc);
-                if (countdown.isNegative) countdown = Duration.zero;
-                _countdownDurations[e['cancellation_id']] = countdown;
-              }
-
               return {
                 'cancellationId': e['cancellation_id'],
                 'bookingId': e['booking_id'],
@@ -591,11 +564,13 @@ class _BookingPageState extends State<BookingPage> {
     String bookingId,
   ) async {
     try {
+      // อัพเดตสถานะ booking เป็น cancelled
       await supabase
           .from('bookings')
           .update({'status': 'cancelled'})
           .eq('booking_id', bookingId);
 
+      // ดึงข้อมูล booking เพื่อหาผู้จอง (farmer_id)
       final bookingResponse =
           await supabase
               .from('bookings')
@@ -613,6 +588,7 @@ class _BookingPageState extends State<BookingPage> {
         );
       }
 
+      // ลบแถวคำขอยกเลิก
       await supabase
           .from('bookingcancellations')
           .delete()
@@ -626,8 +602,53 @@ class _BookingPageState extends State<BookingPage> {
     }
   }
 
+  Future<void> _autoApproveCancellation(
+    String cancellationId,
+    String bookingId,
+  ) async {
+    try {
+      // อัพเดตสถานะ booking เป็น cancelled
+      await supabase
+          .from('bookings')
+          .update({'status': 'cancelled'})
+          .eq('booking_id', bookingId);
+
+      // ดึงข้อมูล booking เพื่อหาผู้จอง (farmer_id)
+      final bookingResponse =
+          await supabase
+              .from('bookings')
+              .select('farmer_id')
+              .eq('booking_id', bookingId)
+              .single();
+
+      final farmerId = bookingResponse?['farmer_id'];
+
+      if (farmerId != null) {
+        await _sendNotification(
+          userId: farmerId,
+          title: 'อนุมัติการยกเลิกการจองอัตโนมัติ',
+          message:
+              'คำขอยกเลิกการจองพาหนะของคุณได้รับการอนุมัติอัตโนมัติเนื่องจากครบกำหนด 24 ชั่วโมง',
+        );
+      }
+
+      // ลบแถวคำขอยกเลิก
+      await supabase
+          .from('bookingcancellations')
+          .delete()
+          .eq('cancellation_id', cancellationId);
+
+      print(
+        'Auto-approved cancellation: $cancellationId for booking: $bookingId',
+      );
+    } catch (e) {
+      print('Error auto-approving cancellation: $e');
+    }
+  }
+
   Future<void> _rejectCancellation(String cancellationId) async {
     try {
+      // ลบแถวคำขอยกเลิก
       await supabase
           .from('bookingcancellations')
           .delete()
@@ -635,11 +656,9 @@ class _BookingPageState extends State<BookingPage> {
 
       _showSnackBar('ปฏิเสธคำขอยกเลิกเรียบร้อยแล้ว');
       await _fetchCancellationRequests();
+      await _fetchBookings(); // Refresh bookings to show buttons again
     } catch (e) {
-      _showSnackBar(
-        'เกิดข้อผิดพลาดในการปฏิเสธ: $e',
-        backgroundColor: Colors.red,
-      );
+      _showSnackBar('เกิดข้อผิดพลาด: $e', backgroundColor: Colors.red);
     }
   }
 
@@ -649,6 +668,7 @@ class _BookingPageState extends State<BookingPage> {
     );
   }
 
+  // ฟังก์ชันแสดงรายละเอียดการจอง
   void _showBookingDetails(Map<String, dynamic> booking) {
     showDialog(
       context: context,
@@ -666,6 +686,7 @@ class _BookingPageState extends State<BookingPage> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
+                      // Header
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
@@ -680,6 +701,7 @@ class _BookingPageState extends State<BookingPage> {
                         ],
                       ),
                       const SizedBox(height: 12),
+                      // Booking ID and status
                       Container(
                         padding: const EdgeInsets.all(12),
                         decoration: BoxDecoration(
@@ -721,6 +743,7 @@ class _BookingPageState extends State<BookingPage> {
                         style: TextStyle(color: Colors.grey.shade600),
                       ),
                       const SizedBox(height: 20),
+                      // Customer info
                       Text(
                         'ข้อมูลลูกค้า',
                         style: Theme.of(context).textTheme.titleMedium
@@ -828,6 +851,7 @@ class _BookingPageState extends State<BookingPage> {
                         ),
                       ),
                       const SizedBox(height: 20),
+                      // Vehicle info
                       Text(
                         'ข้อมูลพาหนะ',
                         style: Theme.of(context).textTheme.titleMedium
@@ -873,7 +897,7 @@ class _BookingPageState extends State<BookingPage> {
                             ),
                             const SizedBox(height: 12),
                             Text(
-                              'ราคาเช่า: ${booking['vehicle']['price_per_day']?.toString() ?? booking['vehicle']['price']?.toString() ?? '-'} บาท/ชั่วโมง',
+                              'ราคาเช่า: ${booking['vehicle']['price_per_day']?.toString() ?? booking['vehicle']['price']?.toString() ?? '-'} บาท/วัน',
                               style: const TextStyle(
                                 fontWeight: FontWeight.w600,
                               ),
@@ -907,6 +931,7 @@ class _BookingPageState extends State<BookingPage> {
                         ),
                       ),
                       const SizedBox(height: 20),
+                      // Booking details
                       Text(
                         'รายละเอียดการจอง',
                         style: Theme.of(context).textTheme.titleMedium
@@ -1029,22 +1054,6 @@ class _BookingPageState extends State<BookingPage> {
       return const Center(child: Text('ไม่มีคำขอยกเลิกการจองใหม่'));
     }
 
-    String formatDuration(Duration d) {
-      if (d.inHours > 0) {
-        final h = d.inHours;
-        final m = d.inMinutes % 60;
-        final s = d.inSeconds % 60;
-        return '${h}ชม. ${m}นาที ${s}วินาที';
-      } else if (d.inMinutes > 0) {
-        final m = d.inMinutes;
-        final s = d.inSeconds % 60;
-        return '${m}นาที ${s}วินาที';
-      } else {
-        final s = d.inSeconds;
-        return '${s}วินาที';
-      }
-    }
-
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1060,9 +1069,31 @@ class _BookingPageState extends State<BookingPage> {
           itemBuilder: (context, index) {
             final request = cancellationRequests[index];
             final booking = request['booking'];
-            final cancellationId = request['cancellationId'];
-            final countdown =
-                _countdownDurations[cancellationId] ?? Duration.zero;
+            final cancelledAt = DateTime.tryParse(request['cancelledAt'] ?? '');
+            String timeLeft = '';
+            Color timeLeftColor = Colors.black;
+
+            if (cancelledAt != null) {
+              final now = DateTime.now().toUtc();
+              final diff = now.difference(cancelledAt);
+              final totalDuration = Duration(hours: 24);
+              final elapsed = now.difference(cancelledAt);
+              final remaining = totalDuration - elapsed;
+
+              final hoursLeft = remaining.inHours;
+              final minutesLeft = remaining.inMinutes % 60;
+
+              if (hoursLeft > 0) {
+                timeLeft = '${hoursLeft}h ${minutesLeft}m';
+                timeLeftColor = hoursLeft > 3 ? Colors.green : Colors.orange;
+              } else if (hoursLeft == 0 && minutesLeft > 0) {
+                timeLeft = '${minutesLeft}m';
+                timeLeftColor = Colors.orange;
+              } else {
+                timeLeft = 'หมดเวลา';
+                timeLeftColor = Colors.red;
+              }
+            }
 
             return Card(
               margin: const EdgeInsets.symmetric(vertical: 8),
@@ -1071,26 +1102,37 @@ class _BookingPageState extends State<BookingPage> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      'คำขอยกเลิกการจอง: ${request['bookingId']}',
-                      style: const TextStyle(fontWeight: FontWeight.bold),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(
+                          'คำขอยกเลิกการจอง: ${request['bookingId']}',
+                          style: const TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: timeLeftColor.withOpacity(0.2),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Text(
+                            timeLeft,
+                            style: TextStyle(
+                              color: timeLeftColor,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                     const SizedBox(height: 8),
                     Text('ลูกค้า: ${booking['customerName']}'),
                     Text('พาหนะ: ${booking['vehicle']['name']}'),
                     Text('วันที่จอง: ${booking['bookingDate']}'),
                     Text('เหตุผล: ${request['cancelReason']}'),
-                    const SizedBox(height: 8),
-                    Text(
-                      'เวลาที่เหลือ: ${countdown > Duration.zero ? formatDuration(countdown) : "หมดเวลา"}',
-                      style: TextStyle(
-                        color:
-                            countdown > Duration.zero
-                                ? Colors.black
-                                : Colors.red,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
                     const SizedBox(height: 12),
                     Row(
                       children: [
@@ -1107,7 +1149,10 @@ class _BookingPageState extends State<BookingPage> {
                         ),
                         const SizedBox(width: 12),
                         OutlinedButton(
-                          onPressed: () => _rejectCancellation(cancellationId),
+                          onPressed:
+                              () => _rejectCancellation(
+                                request['cancellationId'],
+                              ),
                           child: const Text('ปฏิเสธ'),
                           style: OutlinedButton.styleFrom(),
                         ),
@@ -1165,7 +1210,9 @@ class _BookingPageState extends State<BookingPage> {
       case 2:
         Navigator.pushReplacement(
           context,
-          MaterialPageRoute(builder: (context) => AgriVehicleManagementPage()),
+          MaterialPageRoute(
+            builder: (context) => const AgriVehicleManagementPage(),
+          ),
         );
         break;
       case 3:
@@ -1189,6 +1236,63 @@ class _BookingPageState extends State<BookingPage> {
       default:
         break;
     }
+  }
+
+  // Helper function to convert UTC to Thailand time (UTC+7)
+  DateTime convertUtcToThailandTime(DateTime utcTime) {
+    return utcTime.add(const Duration(hours: 7));
+  }
+
+  // Helper function to format countdown time
+  String _formatCountdown(Duration duration) {
+    final hours = duration.inHours;
+    final minutes = duration.inMinutes.remainder(60);
+    final seconds = duration.inSeconds.remainder(60);
+    return '${hours.toString().padLeft(2, '0')}:${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+  }
+
+  // Function to check if cancellation is still allowed (within 24 hours from created_at)
+  bool _isCancellationAllowed(String bookingId) {
+    final booking = bookings.firstWhere(
+      (b) => b['id'] == bookingId,
+      orElse: () => {},
+    );
+    final createdAtStr = booking['created_at'] as String?;
+
+    if (createdAtStr == null || createdAtStr.isEmpty) return false;
+
+    final createdAtUtc = DateTime.tryParse(createdAtStr);
+    if (createdAtUtc == null) return false;
+
+    final createdAtThailand = convertUtcToThailandTime(createdAtUtc);
+    final nowThailand = convertUtcToThailandTime(DateTime.now().toUtc());
+    final diff = nowThailand.difference(createdAtThailand);
+    return diff.inHours < 24;
+  }
+
+  // Function to get remaining time for cancellation (from created_at)
+  Duration _getRemainingTime(String bookingId) {
+    final booking = bookings.firstWhere(
+      (b) => b['id'] == bookingId,
+      orElse: () => {},
+    );
+    final createdAtStr = booking['created_at'] as String?;
+
+    if (createdAtStr == null || createdAtStr.isEmpty) return Duration.zero;
+
+    final createdAtUtc = DateTime.tryParse(createdAtStr);
+    if (createdAtUtc == null) return Duration.zero;
+
+    final createdAtThailand = convertUtcToThailandTime(createdAtUtc);
+    final nowThailand = convertUtcToThailandTime(DateTime.now().toUtc());
+    final elapsed = nowThailand.difference(createdAtThailand);
+    final totalDuration = const Duration(hours: 24);
+
+    if (elapsed >= totalDuration) {
+      return Duration.zero;
+    }
+
+    return totalDuration - elapsed;
   }
 
   @override
@@ -1234,6 +1338,7 @@ class _BookingPageState extends State<BookingPage> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
+                    // Filters section
                     Container(
                       padding: const EdgeInsets.all(24),
                       decoration: BoxDecoration(
@@ -1408,7 +1513,9 @@ class _BookingPageState extends State<BookingPage> {
                       ),
                     ),
                     const SizedBox(height: 24),
+                    // แสดงคำขอยกเลิกการจอง
                     _buildCancellationRequestsSection(),
+                    // Tabs
                     SingleChildScrollView(
                       scrollDirection: Axis.horizontal,
                       child: Row(
@@ -1450,6 +1557,7 @@ class _BookingPageState extends State<BookingPage> {
                       ),
                     ),
                     const SizedBox(height: 24),
+                    // Booking table
                     LayoutBuilder(
                       builder: (context, constraints) {
                         return Container(
@@ -1535,6 +1643,9 @@ class _BookingPageState extends State<BookingPage> {
                                 ],
                                 rows:
                                     filteredBookings.map((booking) {
+                                      print(
+                                        'จำนวน booking ที่แสดง: ${filteredBookings.length}',
+                                      );
                                       return DataRow(
                                         cells: [
                                           DataCell(Text(booking['id'])),
@@ -1632,7 +1743,16 @@ class _BookingPageState extends State<BookingPage> {
                                                       ),
                                                   tooltip: 'ดูรายละเอียด',
                                                 ),
-                                                if (booking['status'] ==
+                                                // Check if there's a cancellation request for this booking
+                                                if (cancellationRequests.any(
+                                                  (request) =>
+                                                      request['bookingId'] ==
+                                                      booking['id'],
+                                                )) ...[
+                                                  // If there is, don't show the buttons
+                                                ]
+                                                // สำหรับ booking ที่อยู่ในสถานะ pending
+                                                else if (booking['status'] ==
                                                     'pending') ...[
                                                   IconButton(
                                                     icon: const Icon(
@@ -1645,18 +1765,64 @@ class _BookingPageState extends State<BookingPage> {
                                                         ),
                                                     tooltip: 'ยืนยันการจอง',
                                                   ),
-                                                  IconButton(
-                                                    icon: const Icon(
-                                                      Icons.cancel,
-                                                      color: Colors.red,
-                                                    ),
-                                                    onPressed:
-                                                        () =>
-                                                            _showCancelReasonDialog(
-                                                              booking['id'],
+                                                  // แสดงเวลานับถอยหลังถาวร
+                                                  if (_isCancellationAllowed(
+                                                    booking['id'],
+                                                  )) ...[
+                                                    Container(
+                                                      padding:
+                                                          const EdgeInsets.symmetric(
+                                                            horizontal: 8,
+                                                          ),
+                                                      child: Column(
+                                                        mainAxisAlignment:
+                                                            MainAxisAlignment
+                                                                .center,
+                                                        children: [
+                                                          Text(
+                                                            _formatCountdown(
+                                                              _getRemainingTime(
+                                                                booking['id'],
+                                                              ),
                                                             ),
-                                                    tooltip: 'ยกเลิกการจอง',
-                                                  ),
+                                                            style:
+                                                                const TextStyle(
+                                                                  fontSize: 12,
+                                                                  fontWeight:
+                                                                      FontWeight
+                                                                          .bold,
+                                                                  color:
+                                                                      Colors
+                                                                          .red,
+                                                                ),
+                                                          ),
+                                                          IconButton(
+                                                            icon: const Icon(
+                                                              Icons.cancel,
+                                                              color: Colors.red,
+                                                            ),
+                                                            onPressed:
+                                                                () => _showCancelReasonDialog(
+                                                                  booking['id'],
+                                                                ),
+                                                            tooltip:
+                                                                'ยกเลิกการจอง',
+                                                          ),
+                                                        ],
+                                                      ),
+                                                    ),
+                                                  ] else ...[
+                                                    // เมื่อเวลาหมด แสดงปุ่มยกเลิกที่ถูกปิดใช้งาน
+                                                    IconButton(
+                                                      icon: const Icon(
+                                                        Icons.cancel,
+                                                        color: Colors.grey,
+                                                      ),
+                                                      onPressed: null,
+                                                      tooltip:
+                                                          'หมดเวลาการยกเลิก',
+                                                    ),
+                                                  ],
                                                 ] else if (booking['status'] ==
                                                     'confirmed') ...[
                                                   IconButton(
@@ -1695,13 +1861,16 @@ class _BookingPageState extends State<BookingPage> {
     );
   }
 
+  // ฟังก์ชันยืนยันการจอง
   Future<void> _confirmBooking(String bookingId) async {
     try {
+      // อัพเดตสถานะ booking เป็น confirmed
       await supabase
           .from('bookings')
           .update({'status': 'confirmed'})
           .eq('booking_id', bookingId);
 
+      // ดึงข้อมูล booking เพื่อหาผู้จอง (farmer_id)
       final bookingResponse =
           await supabase
               .from('bookings')
@@ -1731,11 +1900,13 @@ class _BookingPageState extends State<BookingPage> {
 
   Future<void> _markAsComplete(String bookingId, String farmerId) async {
     try {
+      // อัปเดตสถานะ booking เป็น waiting_farmer_confirm
       await supabase
           .from('bookings')
           .update({'status': 'waiting_farmer_confirm'})
           .eq('booking_id', bookingId);
 
+      // ส่ง notification ไปหาชาวนา
       await _sendNotification(
         userId: farmerId,
         title: 'แจ้งเสร็จสิ้นงาน',
@@ -1773,6 +1944,7 @@ class _BookingPageState extends State<BookingPage> {
             ElevatedButton(
               onPressed: () {
                 if (reasonController.text.trim().isEmpty) {
+                  // แจ้งเตือนถ้าไม่กรอกเหตุผล
                   ScaffoldMessenger.of(context).showSnackBar(
                     const SnackBar(content: Text('กรุณาระบุเหตุผลก่อนยกเลิก')),
                   );
@@ -1792,8 +1964,10 @@ class _BookingPageState extends State<BookingPage> {
     }
   }
 
+  // ฟังก์ชันยกเลิกการจอง
   Future<void> _cancelBookingWithReason(String bookingId, String reason) async {
     try {
+      // ดึง user_type ของผู้ใช้ปัจจุบัน
       final currentUserId = supabase.auth.currentUser?.id;
       String? userType;
 
@@ -1808,11 +1982,13 @@ class _BookingPageState extends State<BookingPage> {
         userType = userResponse?['user_type'];
       }
 
+      // อัพเดตสถานะ booking เป็น cancelled
       await supabase
           .from('bookings')
           .update({'status': 'cancelled'})
           .eq('booking_id', bookingId);
 
+      // บันทึกเหตุผลการยกเลิกพร้อม user_type แทน cancelled_by
       await supabase.from('bookingcancellations').insert({
         'booking_id': bookingId,
         'cancel_reason': reason,
@@ -1820,6 +1996,7 @@ class _BookingPageState extends State<BookingPage> {
         'cancelled_at': DateTime.now().toUtc().toIso8601String(),
       });
 
+      // ดึงข้อมูล booking เพื่อหาผู้จอง (farmer_id)
       final bookingResponse =
           await supabase
               .from('bookings')
